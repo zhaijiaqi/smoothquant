@@ -17,20 +17,41 @@ from transformers.models.falcon.modeling_falcon import FalconDecoderLayer
 
 @torch.no_grad()
 def smooth_ln_fcs(ln, fcs, act_scales, alpha=0.5):
+    """
+    对LayerNorm和后接的全连接层(fc)进行平滑处理，从而改善量化效果。
+
+    Args:
+        ln (nn.LayerNorm): 前置的LayerNorm模块
+        fcs (nn.Linear or List[nn.Linear]): 一个或多个后续全连接层
+        act_scales (torch.Tensor): 激活缩放因子，与输入channels数等长
+        alpha (float): 控制激活-权重平滑分配的系数，越大越偏向对激活进行缩放
+
+    主要思想：
+        对于每个输入通道，均衡激活量和权重的尺度，保证量化友好。
+    """
+    # 如果fcs不是列表，转换为单元素列表，便于统一处理
     if not isinstance(fcs, list):
         fcs = [fcs]
+    # 检查ln类型安全
     assert isinstance(ln, nn.LayerNorm)
+    # 检查每个全连接层的类型及尺寸匹配性
     for fc in fcs:
         assert isinstance(fc, nn.Linear)
         assert ln.weight.numel() == fc.in_features == act_scales.numel()
 
+    # 获取权重所在设备与数据类型
     device, dtype = fcs[0].weight.device, fcs[0].weight.dtype
+    # 激活尺度迁移到相应设备与精度
     act_scales = act_scales.to(device=device, dtype=dtype)
+
+    # 计算所有fc层权重在每一输入通道上的最大绝对值，shape: (len(fcs), in_features)
     weight_scales = torch.cat(
         [fc.weight.abs().max(dim=0, keepdim=True)[0] for fc in fcs], dim=0
     )
+    # 跨多个fc，对于同一输入通道，取最大权重绝对值，避免为零
     weight_scales = weight_scales.max(dim=0)[0].clamp(min=1e-5)
 
+    # 计算平滑缩放因子： act^alpha / weight^(1-alpha)
     scales = (
         (act_scales.pow(alpha) / weight_scales.pow(1 - alpha))
         .clamp(min=1e-5)
@@ -38,9 +59,11 @@ def smooth_ln_fcs(ln, fcs, act_scales, alpha=0.5):
         .to(dtype)
     )
 
+    # 对LayerNorm的权重和偏置向量除以scales，归一化
     ln.weight.div_(scales)
     ln.bias.div_(scales)
 
+    # 对每个fc的权重矩阵每列乘以相应的缩放因子
     for fc in fcs:
         fc.weight.mul_(scales.view(1, -1))
 
